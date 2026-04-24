@@ -165,6 +165,7 @@ Gate-Out → TAT Recorded → Analytics Updated → Carrier Scorecard Refreshed
 - Docker Compose v2+
 - *(Optional)* Running HaulSync core instance for shared master data
 - *(Optional)* ERP system with REST API or webhook support for GR/PO sync
+- Dedicated app in play store (Kotlin) shall be provided for enterprice users post consultation from implimentation engineers of Haulsync
 
 ### 1. Clone the repository
 
