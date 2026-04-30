@@ -1,0 +1,50 @@
+version: '3.9'
+
+# Production overrides — use with:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+
+services:
+
+  postgres:
+    restart: always
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}   # must be set in prod .env
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  redis:
+    restart: always
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "20m"
+        max-file: "3"
+
+  backend:
+    build:
+      target: production
+    restart: always
+    environment:
+      NODE_ENV: production
+    volumes:
+      - uploads_data:/app/uploads   # keep uploads volume, remove bind-mount
+    # No bind-mount source in production — image is the artifact
+    ports: []   # expose only through nginx in prod
+
+  frontend:
+    build:
+      target: production
+    restart: always
+    ports: []   # served by nginx in prod
+
+  nginx:
+    restart: always
+    profiles: []   # enable nginx in prod (no profile filter)
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "100m"
+        max-file: "10"

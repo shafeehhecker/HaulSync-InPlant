@@ -1,72 +1,162 @@
+version: '3.9'
+
 services:
 
-  # ── PostgreSQL ───────────────────────────────────────────────────────────────
-  db:
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
     image: postgres:15-alpine
+    container_name: inplant_postgres
     restart: unless-stopped
     environment:
-      POSTGRES_USER:     ${DB_USER:-haulsync}
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-haulsync_secret}
-      POSTGRES_DB:       ${DB_NAME:-haulsync_ptl}
+      POSTGRES_DB:       ${POSTGRES_DB:-haulsync_inplant}
+      POSTGRES_USER:     ${POSTGRES_USER:-haulsync}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-haulsync_secret}
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
     ports:
-      - "5432:5432"
+      - "${POSTGRES_PORT:-5432}:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-haulsync}"]
-      interval: 5s
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-haulsync} -d ${POSTGRES_DB:-haulsync_inplant}"]
+      interval: 10s
       timeout: 5s
-      retries: 10
+      retries: 5
+    networks:
+      - inplant_net
 
-  # ── Backend API ──────────────────────────────────────────────────────────────
+  # ── Redis (session cache + Socket.io adapter for multi-instance) ────────────
+  redis:
+    image: redis:7-alpine
+    container_name: inplant_redis
+    restart: unless-stopped
+    command: redis-server --requirepass ${REDIS_PASSWORD:-redis_secret} --appendonly yes
+    volumes:
+      - redis_data:/data
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD:-redis_secret}", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - inplant_net
+
+  # ── Backend (Express + Prisma) ──────────────────────────────────────────────
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      target: ${NODE_ENV:-development}
+    container_name: inplant_backend
     restart: unless-stopped
     depends_on:
-      db:
+      postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     environment:
-      DATABASE_URL:       postgresql://${DB_USER:-haulsync}:${DB_PASSWORD:-haulsync_secret}@db:5432/${DB_NAME:-haulsync_ptl}
-      JWT_SECRET:         ${JWT_SECRET:-change_me_in_production_32chars}
-      JWT_EXPIRES_IN:     ${JWT_EXPIRES_IN:-7d}
-      PORT:               5002
-      NODE_ENV:           ${NODE_ENV:-production}
-      FRONTEND_URL:       ${FRONTEND_URL:-http://localhost:3002,http://localhost:5174}
-      GPS_PROVIDER:       ${GPS_PROVIDER:-mock}
-      GPS_API_KEY:        ${GPS_API_KEY:-}
-      GPS_WEBHOOK_SECRET: ${GPS_WEBHOOK_SECRET:-}
-      EWAY_CLIENT_ID:     ${EWAY_CLIENT_ID:-}
-      EWAY_CLIENT_SECRET: ${EWAY_CLIENT_SECRET:-}
-      EWAY_GSTIN:         ${EWAY_GSTIN:-}
-      HAULSYNC_CORE_URL:      ${HAULSYNC_CORE_URL:-}
-      HAULSYNC_CORE_API_KEY:  ${HAULSYNC_CORE_API_KEY:-}
-    ports:
-      - "5002:5002"
+      NODE_ENV:            ${NODE_ENV:-development}
+      PORT:                5001
+      DATABASE_URL:        postgresql://${POSTGRES_USER:-haulsync}:${POSTGRES_PASSWORD:-haulsync_secret}@postgres:5432/${POSTGRES_DB:-haulsync_inplant}?schema=public
+      JWT_SECRET:          ${JWT_SECRET:-change-me-in-production-min-32-chars}
+      FRONTEND_URL:        ${FRONTEND_URL:-http://localhost:3001}
+      REDIS_URL:           redis://:${REDIS_PASSWORD:-redis_secret}@redis:6379
+      FREE_TIME_MINUTES:   ${FREE_TIME_MINUTES:-180}
+      DETENTION_RATE_PER_HOUR: ${DETENTION_RATE_PER_HOUR:-750}
+      DETENTION_ALERT_AT_MINUTES:   ${DETENTION_ALERT_AT_MINUTES:-60}
+      DETENTION_ESCALATE_AT_MINUTES: ${DETENTION_ESCALATE_AT_MINUTES:-30}
+      SMTP_HOST:   ${SMTP_HOST:-}
+      SMTP_PORT:   ${SMTP_PORT:-587}
+      SMTP_USER:   ${SMTP_USER:-}
+      SMTP_PASS:   ${SMTP_PASS:-}
     volumes:
+      - ./backend:/app
+      - /app/node_modules
       - uploads_data:/app/uploads
-    command: >
-      sh -c "npx prisma migrate deploy && node prisma/seed.js && node server.js"
+    ports:
+      - "${BACKEND_PORT:-5001}:5001"
+    networks:
+      - inplant_net
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:5002/health || exit 1"]
-      interval: 10s
+      test: ["CMD-SHELL", "wget -qO- http://localhost:5001/health || exit 1"]
+      interval: 15s
       timeout: 5s
-      retries: 10
-      start_period: 40s
+      retries: 5
+      start_period: 30s
 
-  # ── Frontend ─────────────────────────────────────────────────────────────────
+  # ── Frontend (Vite dev server) ──────────────────────────────────────────────
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      target: ${NODE_ENV:-development}
+    container_name: inplant_frontend
     restart: unless-stopped
     depends_on:
       backend:
         condition: service_healthy
+    environment:
+      VITE_API_URL: ${VITE_API_URL:-http://localhost:5001}
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
     ports:
-      - "3002:80"
+      - "${FRONTEND_PORT:-3001}:3001"
+    networks:
+      - inplant_net
 
+  # ── Nginx reverse proxy (production only) ───────────────────────────────────
+  nginx:
+    image: nginx:1.25-alpine
+    container_name: inplant_nginx
+    restart: unless-stopped
+    depends_on:
+      - backend
+      - frontend
+    volumes:
+      - ./docker/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./docker/nginx/conf.d:/etc/nginx/conf.d:ro
+      - nginx_logs:/var/log/nginx
+    ports:
+      - "${NGINX_HTTP_PORT:-80}:80"
+      - "${NGINX_HTTPS_PORT:-443}:443"
+    networks:
+      - inplant_net
+    profiles:
+      - production
+
+  # ── DB migration + seed runner (runs once then exits) ──────────────────────
+  migrate:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      target: development
+    container_name: inplant_migrate
+    command: sh -c "npx prisma migrate deploy && node prisma/seed.js"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-haulsync}:${POSTGRES_PASSWORD:-haulsync_secret}@postgres:5432/${POSTGRES_DB:-haulsync_inplant}?schema=public
+    networks:
+      - inplant_net
+    profiles:
+      - migrate
+
+# ── Volumes ─────────────────────────────────────────────────────────────────
 volumes:
   postgres_data:
+    driver: local
+  redis_data:
+    driver: local
   uploads_data:
+    driver: local
+  nginx_logs:
+    driver: local
+
+# ── Networks ─────────────────────────────────────────────────────────────────
+networks:
+  inplant_net:
+    driver: bridge
+    name: haulsync_inplant_network
