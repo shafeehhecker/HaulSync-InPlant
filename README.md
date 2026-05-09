@@ -10,8 +10,7 @@
 
 ---
 
-## Architecture 
-hello
+## Architecture .
 
 ```
 haulsync-inplant/
